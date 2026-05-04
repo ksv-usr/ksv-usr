@@ -113,17 +113,3 @@ class DiscordService(QObject):
         if isinstance(ch, discord.abc.Messageable):
             return ch
         return None
-
-    # -- Coroutines (must be run via submit) ----------------------------
-
-    async def fetch_messages_coro(
-        self, channel_id: int, limit: int = 100
-    ) -> List[discord.Message]:
-        channel = self.get_channel(channel_id)
-        if not channel:
-            return []
-        msgs: List[discord.Message] = []
-        async for m in channel.history(limit=limit):
-            msgs.append(m)
-        msgs.reverse()
-        return msgs

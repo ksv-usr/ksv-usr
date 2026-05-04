@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Awaitable, Callable, Iterable, Optional
+from typing import Callable, Iterable, Optional
+from urllib.parse import unquote, urlparse
 
 import aiohttp
 import discord
@@ -10,6 +11,11 @@ import discord
 
 _INVALID_FS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _URL_RE = re.compile(r'https?://[^\s<>"\']+')
+_DISCORD_CDN_HOSTS = (
+    "cdn.discordapp.com",
+    "media.discordapp.net",
+    "images.discordapp.net",
+)
 
 LogFn = Callable[[str], None]
 
@@ -41,7 +47,27 @@ def unique_path(folder: Path, filename: str) -> Path:
     return folder / f"{stem}_{i}{suffix}"
 
 
-async def _save_attachment(session: aiohttp.ClientSession, att: discord.Attachment, folder: Path) -> Path:
+def is_discord_cdn(url: str) -> bool:
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:  # noqa: BLE001
+        return False
+    return any(host == h or host.endswith("." + h) for h in _DISCORD_CDN_HOSTS)
+
+
+def filename_from_url(url: str, fallback: str = "cdn-file") -> str:
+    try:
+        path = urlparse(url).path
+    except Exception:  # noqa: BLE001
+        return fallback
+    last = path.rsplit("/", 1)[-1]
+    last = unquote(last).strip()
+    return last or fallback
+
+
+async def _save_attachment(
+    session: aiohttp.ClientSession, att: discord.Attachment, folder: Path
+) -> Path:
     path = unique_path(folder, att.filename)
     async with session.get(att.url) as resp:
         resp.raise_for_status()
@@ -51,20 +77,20 @@ async def _save_attachment(session: aiohttp.ClientSession, att: discord.Attachme
     return path
 
 
-def _format_message(msg: discord.Message) -> str:
+async def _save_url(
+    session: aiohttp.ClientSession, url: str, folder: Path
+) -> Path:
+    path = unique_path(folder, filename_from_url(url))
+    async with session.get(url) as resp:
+        resp.raise_for_status()
+        data = await resp.read()
+    path.write_bytes(data)
+    return path
+
+
+def _format_header(msg: discord.Message) -> str:
     ts = msg.created_at.isoformat(timespec="seconds")
-    author = f"{msg.author} ({msg.author.id})"
-    parts = [f"[{ts}] {author}"]
-    if msg.content:
-        parts.append(msg.content)
-    for att in msg.attachments:
-        parts.append(f"[piece-jointe] {att.filename} -> {att.url}")
-    for emb in msg.embeds:
-        if emb.url:
-            parts.append(f"[embed] {emb.url}")
-        if emb.description:
-            parts.append(f"[embed-desc] {emb.description}")
-    return "\n".join(parts) + "\n"
+    return f"[{ts}] {msg.author} ({msg.author.id})"
 
 
 async def export_channel(
@@ -74,10 +100,12 @@ async def export_channel(
     limit: Optional[int] = None,
     log: Optional[LogFn] = None,
 ) -> Path:
-    """Export one channel's history into dest_root/<channel>/.
+    """Export one channel: messages.txt, links.txt, every attachment, every Discord-CDN URL.
 
-    Writes messages.txt, links.txt, and saves every attachment.
-    Attachments are written to disk only — never executed.
+    Discord CDN URLs found in message text are downloaded as files
+    (cdn.discordapp.com / media.discordapp.net / images.discordapp.net).
+    Other URLs are written to links.txt. Attachments are written as
+    bytes only — never executed.
     """
     label = getattr(channel, "name", None) or f"dm-{getattr(channel, 'id', 'x')}"
     folder = dest_root / safe_name(f"{label}-{channel.id}")
@@ -93,18 +121,43 @@ async def export_channel(
             try:
                 async for msg in channel.history(limit=limit, oldest_first=True):
                     count += 1
-                    f.write(_format_message(msg))
-                    f.write("\n")
-                    for url in _URL_RE.findall(msg.content or ""):
-                        lf.write(url + "\n")
+                    f.write(_format_header(msg) + "\n")
+                    if msg.content:
+                        f.write(msg.content + "\n")
+
+                    # Attachments: always download.
                     for att in msg.attachments:
                         try:
                             saved = await _save_attachment(session, att, folder)
+                            f.write(f"[attachment] {att.filename} -> {saved.name}\n")
                             if log:
                                 log(f"  ↓ {saved.name}")
                         except Exception as e:  # noqa: BLE001
+                            f.write(f"[attachment-failed] {att.filename}: {e}\n")
                             if log:
                                 log(f"  ! {att.filename}: {e}")
+
+                    # URLs in content: Discord CDN -> download, else -> links.txt.
+                    for url in _URL_RE.findall(msg.content or ""):
+                        if is_discord_cdn(url):
+                            try:
+                                saved = await _save_url(session, url, folder)
+                                f.write(f"[cdn] {url} -> {saved.name}\n")
+                                if log:
+                                    log(f"  ↓ {saved.name}")
+                            except Exception as e:  # noqa: BLE001
+                                f.write(f"[cdn-failed] {url}: {e}\n")
+                                if log:
+                                    log(f"  ! {url}: {e}")
+                        else:
+                            lf.write(url + "\n")
+
+                    # Embed URLs go to links.txt — they're previews, not files.
+                    for emb in msg.embeds:
+                        if emb.url and not is_discord_cdn(emb.url):
+                            lf.write(emb.url + "\n")
+
+                    f.write("\n")
             except discord.Forbidden:
                 if log:
                     log(f"  accès refusé sur {label}")
