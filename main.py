@@ -21,7 +21,7 @@ from discord_service import DiscordService
 from gui import MainWindow, install_optional_fonts
 
 
-def _prompt_token(app: QApplication) -> str | None:
+def _prompt_token() -> str | None:
     token = os.environ.get("DISCORD_TOKEN", "").strip()
     if token:
         return token
@@ -37,25 +37,42 @@ def _prompt_token(app: QApplication) -> str | None:
     return text or None
 
 
-def main() -> int:
-    app = QApplication(sys.argv)
+async def _amain() -> None:
+    app = QApplication.instance()
+    assert app is not None  # qasync.run created it for us
     install_optional_fonts()
 
-    token = _prompt_token(app)
+    token = _prompt_token()
     if not token:
         QMessageBox.critical(None, "discord.", "A token is required.")
-        return 1
+        return
 
-    loop = qasync.QEventLoop(app)
-    asyncio.set_event_loop(loop)
+    loop = asyncio.get_event_loop()
+    close_event = asyncio.Event()
+    app.aboutToQuit.connect(close_event.set)
 
     service = DiscordService(token)
     window = MainWindow(service, loop)
     window.show()
 
-    with loop:
-        loop.create_task(service.start())
-        loop.run_forever()
+    asyncio.ensure_future(service.start())
+    try:
+        await close_event.wait()
+    finally:
+        await service.stop()
+
+
+def main() -> int:
+    # qasync.run sets up a QApplication, installs the qasync event loop,
+    # and runs the coroutine until completion. This is the documented
+    # pattern — using `with loop: loop.run_forever()` leaves Qt's event
+    # processing un-pumped and hangs discord.py-self at "connecting".
+    if QApplication.instance() is None:
+        QApplication(sys.argv)
+    try:
+        qasync.run(_amain())
+    except asyncio.CancelledError:
+        pass
     return 0
 
 
