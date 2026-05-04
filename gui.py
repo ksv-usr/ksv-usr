@@ -11,7 +11,6 @@ from PyQt6.QtCore import (
     QPropertyAnimation,
     Qt,
     QTimer,
-    QUrl,
     pyqtSignal,
 )
 from PyQt6.QtGui import (
@@ -38,7 +37,14 @@ from PyQt6.QtWidgets import (
 )
 
 from discord_service import DiscordService
-from downloader import downloads_root, export_channel, export_channels, safe_name
+from downloader import (
+    ExportStats,
+    downloads_root,
+    export_channel,
+    export_channels,
+    safe_name,
+    summarize,
+)
 
 
 # ----- Design tokens (the React landing-page rules, translated) ----------
@@ -55,12 +61,6 @@ NOKIA_FG = "#2A3616"
 FONT_SERIF = "'Instrument Serif', 'Cormorant Garamond', 'Georgia', serif"
 FONT_SANS = "'Inter', 'Helvetica Neue', 'Segoe UI', system-ui, sans-serif"
 FONT_NOKIA = "'Nokia Cellphone FC Small', 'Px437 IBM VGA8', 'Courier New', monospace"
-
-VIDEO_URL = (
-    "https://d8j0ntlcm91z4.cloudfront.net/"
-    "user_38xzZboKViGWJOttwIXH07lWA1P/"
-    "hf_20260427_054418_a6d194f0-ac86-4df9-abe5-ded73e596d7c.mp4"
-)
 
 
 GLOBAL_QSS = f"""
@@ -328,28 +328,14 @@ class Hero(QWidget):
         self.setMinimumHeight(640)
         self.setStyleSheet(f"background: {CREAM};")
 
-        # --- Video background (best-effort) --------------------------------
+        # --- Video background ---------------------------------------------
+        # Disabled: the cloudfront h264 file uses Late SEI which the local
+        # ffmpeg decoder cannot handle, spamming stderr with thousands of
+        # "Late SEI is not implemented" lines and slowing the app. The cream
+        # background alone matches the page palette and stays calm.
         self._video_widget = None
         self._player = None
         self._audio = None
-        try:
-            from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
-            from PyQt6.QtMultimediaWidgets import QVideoWidget
-
-            self._video_widget = QVideoWidget(self)
-            self._video_widget.setAspectRatioMode(
-                Qt.AspectRatioMode.KeepAspectRatioByExpanding
-            )
-            self._player = QMediaPlayer(self)
-            self._audio = QAudioOutput(self)
-            self._audio.setMuted(True)
-            self._player.setAudioOutput(self._audio)
-            self._player.setVideoOutput(self._video_widget)
-            self._player.setLoops(QMediaPlayer.Loops.Infinite)
-            self._player.setSource(QUrl(VIDEO_URL))
-            self._player.play()
-        except Exception:  # noqa: BLE001
-            self._video_widget = None
 
         # --- white/5 tint overlay -----------------------------------------
         self._tint = QWidget(self)
@@ -667,8 +653,17 @@ class MainWindow(QMainWindow):
         def done(f: Future) -> None:
             if f.exception():
                 self._save_failed.emit(str(f.exception()))
-            else:
-                self._save_done.emit(str(f.result()))
+                return
+            stats: ExportStats = f.result()
+            body = (
+                f"{stats.label}\n"
+                f"  {stats.messages} messages, {stats.attachments} attachments, "
+                f"{stats.cdn_files} CDN files, {stats.other_links} links\n"
+                f"\n{stats.folder}"
+            )
+            if stats.errors:
+                body += f"\n\n{len(stats.errors)} error(s) — see _export.log"
+            self._save_done.emit(body)
 
         fut.add_done_callback(done)
 
@@ -702,13 +697,15 @@ class MainWindow(QMainWindow):
             self.download_all_btn.setEnabled(True)
             if f.exception():
                 self._save_failed.emit(str(f.exception()))
-            else:
-                self._save_done.emit(str(f.result()))
+                return
+            stats_list = f.result()
+            body = summarize(stats_list) + f"\n\n{dest}"
+            self._save_done.emit(body)
 
         fut.add_done_callback(done)
 
-    def _notify_save_done(self, path: str) -> None:
-        QMessageBox.information(self, "Download finished", f"Saved to:\n{path}")
+    def _notify_save_done(self, body: str) -> None:
+        QMessageBox.information(self, "Download finished", body)
 
     def _notify_save_failed(self, err: str) -> None:
         QMessageBox.warning(self, "Download failed", err)

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import re
+import sys
+import traceback
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable, List, Optional
 from urllib.parse import unquote, urlparse
 
 import aiohttp
@@ -18,6 +21,17 @@ _DISCORD_CDN_HOSTS = (
 )
 
 LogFn = Callable[[str], None]
+
+
+@dataclass
+class ExportStats:
+    label: str
+    folder: Path
+    messages: int = 0
+    attachments: int = 0
+    cdn_files: int = 0
+    other_links: int = 0
+    errors: List[str] = field(default_factory=list)
 
 
 def safe_name(name: str, max_len: int = 80) -> str:
@@ -65,6 +79,16 @@ def filename_from_url(url: str, fallback: str = "cdn-file") -> str:
     return last or fallback
 
 
+def can_read_history(channel: discord.abc.Messageable) -> bool:
+    """True if the current user can fetch the channel's message history."""
+    guild = getattr(channel, "guild", None)
+    if guild is None:
+        return True  # DMs / group DMs are always readable
+    me = guild.me
+    perms = channel.permissions_for(me)
+    return bool(perms.read_messages and perms.read_message_history)
+
+
 async def _save_attachment(
     session: aiohttp.ClientSession, att: discord.Attachment, folder: Path
 ) -> Path:
@@ -93,80 +117,145 @@ def _format_header(msg: discord.Message) -> str:
     return f"[{ts}] {msg.author} ({msg.author.id})"
 
 
+async def _collect_history(
+    channel: discord.abc.Messageable, limit: Optional[int]
+) -> List[discord.Message]:
+    """Fetch the most recent N messages, then return them oldest-first.
+
+    Done in two steps because some self-bot tokens have flaky behaviour
+    with `oldest_first=True`. Newest-first is the API default and is
+    reliable; we just reverse for chronological writing.
+    """
+    msgs: List[discord.Message] = []
+    async for m in channel.history(limit=limit):
+        msgs.append(m)
+    msgs.reverse()
+    return msgs
+
+
 async def export_channel(
     channel: discord.abc.Messageable,
     dest_root: Path,
     *,
     limit: Optional[int] = None,
     log: Optional[LogFn] = None,
-) -> Path:
+) -> ExportStats:
     """Export one channel: messages.txt, links.txt, every attachment, every Discord-CDN URL.
 
-    Discord CDN URLs found in message text are downloaded as files
-    (cdn.discordapp.com / media.discordapp.net / images.discordapp.net).
-    Other URLs are written to links.txt. Attachments are written as
-    bytes only — never executed.
+    Returns ExportStats so callers can show meaningful results. Writes a
+    `_export.log` to the channel folder with everything that happened
+    (including the reason for any skipped channel) — that's the file to
+    open when something looks empty.
     """
     label = getattr(channel, "name", None) or f"dm-{getattr(channel, 'id', 'x')}"
     folder = dest_root / safe_name(f"{label}-{channel.id}")
     folder.mkdir(parents=True, exist_ok=True)
+    stats = ExportStats(label=label, folder=folder)
 
-    transcript = folder / "messages.txt"
-    links = folder / "links.txt"
+    debug = (folder / "_export.log").open("w", encoding="utf-8")
 
-    timeout = aiohttp.ClientTimeout(total=180)
-    count = 0
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        with transcript.open("w", encoding="utf-8") as f, links.open("w", encoding="utf-8") as lf:
-            try:
-                async for msg in channel.history(limit=limit, oldest_first=True):
-                    count += 1
-                    f.write(_format_header(msg) + "\n")
-                    if msg.content:
-                        f.write(msg.content + "\n")
+    def _logline(line: str) -> None:
+        debug.write(line + "\n")
+        debug.flush()
+        sys.stderr.write(f"[{label}] {line}\n")
+        sys.stderr.flush()
+        if log:
+            log(line)
 
-                    # Attachments: always download.
-                    for att in msg.attachments:
+    try:
+        if not can_read_history(channel):
+            msg = "skipped: missing read_message_history permission"
+            stats.errors.append(msg)
+            _logline(msg)
+            return stats
+
+        _logline(f"starting export, limit={limit}")
+        try:
+            messages = await _collect_history(channel, limit)
+        except discord.Forbidden as e:
+            stats.errors.append(f"forbidden while reading history: {e}")
+            _logline(f"forbidden: {e}")
+            return stats
+        except Exception as e:  # noqa: BLE001
+            stats.errors.append(f"history fetch failed: {e}")
+            _logline(f"history fetch failed: {e}\n{traceback.format_exc()}")
+            return stats
+
+        _logline(f"fetched {len(messages)} messages")
+
+        if not messages:
+            _logline("nothing to write")
+            return stats
+
+        timeout = aiohttp.ClientTimeout(total=180)
+        async with aiohttp.ClientSession(timeout=timeout) as session, \
+                (folder / "messages.txt").open("w", encoding="utf-8") as f, \
+                (folder / "links.txt").open("w", encoding="utf-8") as lf:
+            for msg in messages:
+                stats.messages += 1
+                f.write(_format_header(msg) + "\n")
+                if msg.content:
+                    f.write(msg.content + "\n")
+
+                # Attachments: always download.
+                for att in msg.attachments:
+                    try:
+                        saved = await _save_attachment(session, att, folder)
+                        f.write(f"[attachment] {att.filename} -> {saved.name}\n")
+                        stats.attachments += 1
+                        _logline(f"↓ attachment {saved.name}")
+                    except Exception as e:  # noqa: BLE001
+                        f.write(f"[attachment-failed] {att.filename}: {e}\n")
+                        stats.errors.append(f"attachment {att.filename}: {e}")
+                        _logline(f"! attachment {att.filename}: {e}")
+
+                # URLs in content: Discord CDN -> download, else -> links.txt.
+                for url in _URL_RE.findall(msg.content or ""):
+                    if is_discord_cdn(url):
                         try:
-                            saved = await _save_attachment(session, att, folder)
-                            f.write(f"[attachment] {att.filename} -> {saved.name}\n")
-                            if log:
-                                log(f"  ↓ {saved.name}")
+                            saved = await _save_url(session, url, folder)
+                            f.write(f"[cdn] {url} -> {saved.name}\n")
+                            stats.cdn_files += 1
+                            _logline(f"↓ cdn {saved.name}")
                         except Exception as e:  # noqa: BLE001
-                            f.write(f"[attachment-failed] {att.filename}: {e}\n")
-                            if log:
-                                log(f"  ! {att.filename}: {e}")
+                            f.write(f"[cdn-failed] {url}: {e}\n")
+                            stats.errors.append(f"cdn {url}: {e}")
+                            _logline(f"! cdn {url}: {e}")
+                    else:
+                        lf.write(url + "\n")
+                        stats.other_links += 1
 
-                    # URLs in content: Discord CDN -> download, else -> links.txt.
-                    for url in _URL_RE.findall(msg.content or ""):
-                        if is_discord_cdn(url):
-                            try:
-                                saved = await _save_url(session, url, folder)
-                                f.write(f"[cdn] {url} -> {saved.name}\n")
-                                if log:
-                                    log(f"  ↓ {saved.name}")
-                            except Exception as e:  # noqa: BLE001
-                                f.write(f"[cdn-failed] {url}: {e}\n")
-                                if log:
-                                    log(f"  ! {url}: {e}")
-                        else:
-                            lf.write(url + "\n")
+                # Embeds: their .url is generally a preview link, not a file.
+                # Embeds may also expose image/video proxies on the CDN —
+                # download those, log the rest.
+                for emb in msg.embeds:
+                    candidate = None
+                    for src in (emb.image, emb.thumbnail, emb.video):
+                        u = getattr(src, "url", None)
+                        if u and is_discord_cdn(u):
+                            candidate = u
+                            break
+                    if candidate:
+                        try:
+                            saved = await _save_url(session, candidate, folder)
+                            f.write(f"[embed-cdn] {candidate} -> {saved.name}\n")
+                            stats.cdn_files += 1
+                        except Exception as e:  # noqa: BLE001
+                            f.write(f"[embed-cdn-failed] {candidate}: {e}\n")
+                            stats.errors.append(f"embed-cdn {candidate}: {e}")
+                    elif emb.url:
+                        lf.write(emb.url + "\n")
+                        stats.other_links += 1
 
-                    # Embed URLs go to links.txt — they're previews, not files.
-                    for emb in msg.embeds:
-                        if emb.url and not is_discord_cdn(emb.url):
-                            lf.write(emb.url + "\n")
+                f.write("\n")
 
-                    f.write("\n")
-            except discord.Forbidden:
-                if log:
-                    log(f"  accès refusé sur {label}")
-            except Exception as e:  # noqa: BLE001
-                if log:
-                    log(f"  erreur dans {label}: {e}")
-    if log:
-        log(f"{label}: {count} messages")
-    return folder
+        _logline(
+            f"done: {stats.messages} messages, {stats.attachments} attachments, "
+            f"{stats.cdn_files} cdn files, {stats.other_links} other links"
+        )
+        return stats
+    finally:
+        debug.close()
 
 
 async def export_channels(
@@ -175,8 +264,26 @@ async def export_channels(
     *,
     limit: Optional[int] = None,
     log: Optional[LogFn] = None,
-) -> Path:
+) -> List[ExportStats]:
     dest_root.mkdir(parents=True, exist_ok=True)
+    results: List[ExportStats] = []
     for ch in channels:
-        await export_channel(ch, dest_root, limit=limit, log=log)
-    return dest_root
+        results.append(await export_channel(ch, dest_root, limit=limit, log=log))
+    return results
+
+
+def summarize(stats_list: List[ExportStats]) -> str:
+    total_msgs = sum(s.messages for s in stats_list)
+    total_att = sum(s.attachments for s in stats_list)
+    total_cdn = sum(s.cdn_files for s in stats_list)
+    total_links = sum(s.other_links for s in stats_list)
+    skipped = [s.label for s in stats_list if s.messages == 0]
+    lines = [
+        f"{len(stats_list)} channels processed",
+        f"  {total_msgs} messages, {total_att} attachments, "
+        f"{total_cdn} CDN files, {total_links} other links",
+    ]
+    if skipped:
+        lines.append(f"  skipped/empty: {', '.join(skipped[:8])}"
+                     + ("…" if len(skipped) > 8 else ""))
+    return "\n".join(lines)

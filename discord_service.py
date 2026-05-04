@@ -101,7 +101,8 @@ class DiscordService(QObject):
             if not isinstance(ch, discord.TextChannel):
                 continue
             try:
-                if ch.permissions_for(me).read_messages:
+                perms = ch.permissions_for(me)
+                if perms.read_messages and perms.read_message_history:
                     result.append(ch)
             except Exception:  # noqa: BLE001
                 continue
