@@ -102,14 +102,75 @@ async def _save_attachment(
 
 
 async def _save_url(
-    session: aiohttp.ClientSession, url: str, folder: Path
+    session: aiohttp.ClientSession,
+    url: str,
+    folder: Path,
+    *,
+    fetch_url: Optional[str] = None,
 ) -> Path:
+    """Save `url` to disk; if `fetch_url` is given, GET that instead but keep
+    the filename derived from `url`. Lets us swap an expired CDN URL for a
+    refreshed one without changing the saved filename."""
     path = unique_path(folder, filename_from_url(url))
-    async with session.get(url) as resp:
+    async with session.get(fetch_url or url) as resp:
         resp.raise_for_status()
         data = await resp.read()
     path.write_bytes(data)
     return path
+
+
+async def refresh_cdn_urls(
+    client: discord.Client,
+    urls: List[str],
+    log: Optional[LogFn] = None,
+) -> dict[str, str]:
+    """Hit POST /attachments/refresh-urls so expired Discord CDN signatures
+    (ex=, is=, hm= query params) are reissued with a fresh ~24h validity.
+
+    Returns {original_url: refreshed_url}. URLs that the API doesn't return
+    are simply absent from the dict — callers should fall back to the
+    original.
+    """
+    if not urls:
+        return {}
+    token = getattr(getattr(client, "http", None), "token", None)
+    if not token:
+        return {}
+    headers = {
+        "Authorization": token,
+        "Content-Type": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) discord/1.0.9036 Chrome/120 Safari/537.36"
+        ),
+    }
+    out: dict[str, str] = {}
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        # Endpoint accepts up to 50 URLs per request.
+        for i in range(0, len(urls), 50):
+            batch = urls[i:i + 50]
+            try:
+                async with s.post(
+                    "https://discord.com/api/v9/attachments/refresh-urls",
+                    headers=headers,
+                    json={"attachment_urls": batch},
+                ) as r:
+                    if r.status >= 400:
+                        if log:
+                            log(f"refresh-urls HTTP {r.status}")
+                        continue
+                    data = await r.json()
+            except Exception as e:  # noqa: BLE001
+                if log:
+                    log(f"refresh-urls failed: {e}")
+                continue
+            for item in data.get("refreshed_urls", []):
+                orig = item.get("original")
+                ref = item.get("refreshed")
+                if orig and ref:
+                    out[orig] = ref
+    return out
 
 
 def _format_header(msg: discord.Message) -> str:
@@ -137,6 +198,7 @@ async def export_channel(
     channel: discord.abc.Messageable,
     dest_root: Path,
     *,
+    client: Optional[discord.Client] = None,
     limit: Optional[int] = None,
     log: Optional[LogFn] = None,
 ) -> ExportStats:
@@ -187,6 +249,26 @@ async def export_channel(
             _logline("nothing to write")
             return stats
 
+        # Pre-collect every Discord-CDN URL we plan to fetch, then batch-
+        # refresh them via /attachments/refresh-urls. Without this, any URL
+        # whose ex=/is=/hm= signature has expired returns 404 and the file
+        # silently fails to download.
+        cdn_seen: set[str] = set()
+        for msg in messages:
+            for url in _URL_RE.findall(msg.content or ""):
+                if is_discord_cdn(url):
+                    cdn_seen.add(url)
+            for emb in msg.embeds:
+                for src in (emb.image, emb.thumbnail, emb.video):
+                    u = getattr(src, "url", None)
+                    if u and is_discord_cdn(u):
+                        cdn_seen.add(u)
+
+        refresh_map: dict[str, str] = {}
+        if cdn_seen and client is not None:
+            refresh_map = await refresh_cdn_urls(client, list(cdn_seen), log=_logline)
+            _logline(f"refreshed {len(refresh_map)}/{len(cdn_seen)} CDN URLs")
+
         # `async with` only works with async context managers; file objects
         # are sync, so the aiohttp session and the files have to live in
         # separate `with` statements. Putting them on the same line raises
@@ -221,7 +303,10 @@ async def export_channel(
                     for url in _URL_RE.findall(msg.content or ""):
                         if is_discord_cdn(url):
                             try:
-                                saved = await _save_url(session, url, folder)
+                                saved = await _save_url(
+                                    session, url, folder,
+                                    fetch_url=refresh_map.get(url),
+                                )
                                 f.write(f"[cdn] {url} -> {saved.name}\n")
                                 stats.cdn_files += 1
                                 _logline(f"↓ cdn {saved.name}")
@@ -245,7 +330,10 @@ async def export_channel(
                                 break
                         if candidate:
                             try:
-                                saved = await _save_url(session, candidate, folder)
+                                saved = await _save_url(
+                                    session, candidate, folder,
+                                    fetch_url=refresh_map.get(candidate),
+                                )
                                 f.write(f"[embed-cdn] {candidate} -> {saved.name}\n")
                                 stats.cdn_files += 1
                             except Exception as e:  # noqa: BLE001
@@ -270,13 +358,16 @@ async def export_channels(
     channels: Iterable[discord.abc.Messageable],
     dest_root: Path,
     *,
+    client: Optional[discord.Client] = None,
     limit: Optional[int] = None,
     log: Optional[LogFn] = None,
 ) -> List[ExportStats]:
     dest_root.mkdir(parents=True, exist_ok=True)
     results: List[ExportStats] = []
     for ch in channels:
-        results.append(await export_channel(ch, dest_root, limit=limit, log=log))
+        results.append(
+            await export_channel(ch, dest_root, client=client, limit=limit, log=log)
+        )
     return results
 
 

@@ -648,7 +648,14 @@ class MainWindow(QMainWindow):
         def emit_log(line: str) -> None:
             self._log.emit(line)
 
-        fut = self.service.submit(export_channel(ch, dest, limit=limit, log=emit_log))
+        fut = self.service.submit(
+            export_channel(
+                ch, dest,
+                client=self.service.client,
+                limit=limit,
+                log=emit_log,
+            )
+        )
 
         def done(f: Future) -> None:
             if f.exception():
@@ -690,7 +697,12 @@ class MainWindow(QMainWindow):
             self._log.emit(line)
 
         fut = self.service.submit(
-            export_channels(channels, dest, limit=limit, log=emit_log)
+            export_channels(
+                channels, dest,
+                client=self.service.client,
+                limit=limit,
+                log=emit_log,
+            )
         )
 
         def done(f: Future) -> None:
