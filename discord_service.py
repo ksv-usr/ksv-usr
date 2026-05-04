@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import threading
+from concurrent.futures import Future
 from typing import List, Optional
 
 import discord
@@ -7,36 +10,79 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 
 class DiscordService(QObject):
-    """Thin wrapper around discord.py-self to surface state via Qt signals."""
+    """Runs discord.py-self on its own asyncio loop in a daemon thread.
+
+    The Qt thread interacts with it via:
+      - `submit(coro)` -> concurrent.futures.Future
+      - read-only accessors (`guilds`, `text_channels`, `get_channel`)
+      - signals (`ready`, `error`) that fire back on the Qt thread.
+
+    Avoiding qasync sidesteps the QSocketNotifier / startTimer thread
+    warnings seen on PyQt6 + Python 3.12.
+    """
 
     ready = pyqtSignal()
     error = pyqtSignal(str)
-    disconnected = pyqtSignal()
 
     def __init__(self, token: str) -> None:
         super().__init__()
         self._token = token
         self.client = discord.Client(chunk_guilds_at_startup=False)
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._loop_ready = threading.Event()
 
         @self.client.event
-        async def on_ready() -> None:  # noqa: N802 - discord.py callback name
+        async def on_ready() -> None:  # noqa: N802
             self.ready.emit()
 
-        @self.client.event
-        async def on_disconnect() -> None:  # noqa: N802
-            self.disconnected.emit()
+    # -- Lifecycle ------------------------------------------------------
 
-    async def start(self) -> None:
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="discord-loop"
+        )
+        self._thread.start()
+        # Wait until the loop is created, so submit() is safe immediately.
+        self._loop_ready.wait(timeout=5.0)
+
+    def _run(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._loop = loop
+        self._loop_ready.set()
         try:
-            await self.client.start(self._token)
+            loop.run_until_complete(self.client.start(self._token))
         except discord.LoginFailure as e:
             self.error.emit(f"Token invalide: {e}")
         except Exception as e:  # noqa: BLE001
             self.error.emit(f"Connexion échouée: {e}")
+        finally:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:  # noqa: BLE001
+                pass
+            loop.close()
 
-    async def stop(self) -> None:
-        if not self.client.is_closed():
-            await self.client.close()
+    def stop(self) -> None:
+        if self._loop is None:
+            return
+        if self.client.is_closed():
+            return
+        try:
+            fut = asyncio.run_coroutine_threadsafe(self.client.close(), self._loop)
+            fut.result(timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # -- Submit ---------------------------------------------------------
+
+    def submit(self, coro) -> Future:
+        if self._loop is None:
+            raise RuntimeError("DiscordService not started")
+        return asyncio.run_coroutine_threadsafe(coro, self._loop)
+
+    # -- Read-only accessors (safe to call from the Qt thread) ----------
 
     @property
     def me(self) -> Optional[discord.ClientUser]:
@@ -68,7 +114,11 @@ class DiscordService(QObject):
             return ch
         return None
 
-    async def fetch_messages(self, channel_id: int, limit: int = 100) -> List[discord.Message]:
+    # -- Coroutines (must be run via submit) ----------------------------
+
+    async def fetch_messages_coro(
+        self, channel_id: int, limit: int = 100
+    ) -> List[discord.Message]:
         channel = self.get_channel(channel_id)
         if not channel:
             return []

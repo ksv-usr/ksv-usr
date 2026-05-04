@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import asyncio
-import io
+from concurrent.futures import Future
 from pathlib import Path
 from typing import List, Optional
 
@@ -10,7 +9,6 @@ import discord
 from PyQt6.QtCore import (
     QEasingCurve,
     QPropertyAnimation,
-    QSize,
     Qt,
     QTimer,
     pyqtSignal,
@@ -19,13 +17,10 @@ from PyQt6.QtGui import (
     QColor,
     QFont,
     QFontDatabase,
-    QGuiApplication,
-    QPainter,
     QPalette,
     QPixmap,
 )
 from PyQt6.QtWidgets import (
-    QFileDialog,
     QFrame,
     QGraphicsDropShadowEffect,
     QGraphicsOpacityEffect,
@@ -36,9 +31,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
-    QSizePolicy,
     QSpinBox,
-    QStackedLayout,
     QVBoxLayout,
     QWidget,
 )
@@ -55,7 +48,6 @@ INK_60 = "rgba(26,26,26,0.60)"
 INK_40 = "rgba(26,26,26,0.40)"
 INK_10 = "rgba(26,26,26,0.10)"
 BLUE = "#0871E7"
-BLUE_GLINT = "#DEF0FC"
 NOKIA_FG = "#2A3616"
 
 FONT_SERIF_STACK = "'Instrument Serif', 'Cormorant Garamond', 'Georgia', serif"
@@ -231,7 +223,7 @@ class Navbar(QFrame):
             btn = QPushButton(name)
             btn.setProperty("role", "link")
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setEnabled(False)  # purely decorative in this build
+            btn.setEnabled(False)  # decorative — keeps the navbar layout intact
             layout.addWidget(btn)
 
         layout.addStretch(1)
@@ -312,8 +304,10 @@ class MessageCard(QFrame):
         layout.setSpacing(6)
 
         ts = msg.created_at.strftime("%Y-%m-%d %H:%M")
-        header = QLabel(f"<span style='font-weight:600'>{msg.author.display_name}</span>"
-                        f"  <span style='color:{INK_40}'>{ts}</span>")
+        header = QLabel(
+            f"<span style='font-weight:600'>{msg.author.display_name}</span>"
+            f"  <span style='color:{INK_40}'>{ts}</span>"
+        )
         header.setTextFormat(Qt.TextFormat.RichText)
         layout.addWidget(header)
 
@@ -327,8 +321,10 @@ class MessageCard(QFrame):
         for att in msg.attachments:
             row = QHBoxLayout()
             row.setSpacing(8)
-            name = QLabel(f"📎 {att.filename}  <span style='color:{INK_40}'>"
-                          f"{att.size // 1024} KB</span>")
+            name = QLabel(
+                f"📎 {att.filename}  <span style='color:{INK_40}'>"
+                f"{att.size // 1024} KB</span>"
+            )
             name.setTextFormat(Qt.TextFormat.RichText)
             row.addWidget(name, 1)
             layout.addLayout(row)
@@ -346,8 +342,7 @@ class MessageCard(QFrame):
         layout.addLayout(self.thumb_row)
 
         # Per-message download button (only if there's something to save).
-        has_saveable = bool(msg.attachments) or bool(msg.content)
-        if has_saveable:
+        if msg.attachments or msg.content:
             row = QHBoxLayout()
             row.addStretch(1)
             self.save_btn = GhostButton("Download")
@@ -371,21 +366,55 @@ class MessageCard(QFrame):
         self.thumb_row.addStretch(1)
 
 
+# ----- Coroutines for cross-thread work ----------------------------------
+
+
+async def _fetch_bytes(url: str) -> bytes:
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        async with s.get(url) as r:
+            r.raise_for_status()
+            return await r.read()
+
+
+async def _save_message_coro(msg: discord.Message, root: Path) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "message.txt").write_text(
+        f"[{msg.created_at.isoformat(timespec='seconds')}] {msg.author}\n"
+        f"{msg.content or ''}\n",
+        encoding="utf-8",
+    )
+    timeout = aiohttp.ClientTimeout(total=120)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        for att in msg.attachments:
+            try:
+                async with s.get(att.url) as r:
+                    r.raise_for_status()
+                    data = await r.read()
+                (root / safe_name(att.filename)).write_bytes(data)
+            except Exception:  # noqa: BLE001
+                continue
+    return root
+
+
 # ----- Main window --------------------------------------------------------
 
 
 class MainWindow(QWidget):
     """Three-panel browser: servers / channels / messages."""
 
-    request_quit = pyqtSignal()
+    # Cross-thread delivery: emitted from the discord loop, received in Qt.
+    _messages_ready = pyqtSignal(int, object)            # channel_id, list[Message] | None
+    _thumb_ready = pyqtSignal(int, bytes)                # message_id, raw bytes
+    _save_done = pyqtSignal(str)                         # human path
+    _save_failed = pyqtSignal(str)                       # error
+    _log = pyqtSignal(str)
 
-    def __init__(self, service: DiscordService, loop: asyncio.AbstractEventLoop) -> None:
+    def __init__(self, service: DiscordService) -> None:
         super().__init__()
         self.service = service
-        self.loop = loop
         self._current_guild: Optional[discord.Guild] = None
         self._current_channel_id: Optional[int] = None
-        self._http: Optional[aiohttp.ClientSession] = None
 
         self.setWindowTitle("discord. — quiet browser")
         self.resize(1280, 820)
@@ -414,7 +443,6 @@ class MainWindow(QWidget):
         font = QFont()
         font.setPointSize(36)
         self.headline.setFont(font)
-        # Forced via stylesheet too because QFont may not pick the family up.
         self.headline.setStyleSheet(
             f"font-family:{FONT_SERIF_STACK}; font-size:42px; color:{INK};"
         )
@@ -451,9 +479,16 @@ class MainWindow(QWidget):
         self.service.ready.connect(self._on_ready)
         self.service.error.connect(self._on_error)
 
+        # Wire internal cross-thread signals (queued connections by default)
+        self._messages_ready.connect(self._render_messages)
+        self._thumb_ready.connect(self._attach_thumb)
+        self._save_done.connect(self._notify_save_done)
+        self._save_failed.connect(self._notify_save_failed)
+        self._log.connect(self._on_log)
+
     # -- Panels ---------------------------------------------------------
 
-    def _panel_card(self, title: str) -> tuple[QFrame, QVBoxLayout, QLabel]:
+    def _panel_card(self, title: str) -> tuple[QFrame, QVBoxLayout]:
         card = QFrame()
         card.setObjectName("card")
         layout = QVBoxLayout(card)
@@ -464,10 +499,10 @@ class MainWindow(QWidget):
             f"font-family:{FONT_SERIF_STACK}; font-size:22px; color:{INK};"
         )
         layout.addWidget(header)
-        return card, layout, header
+        return card, layout
 
     def _build_server_panel(self) -> QFrame:
-        card, layout, header = self._panel_card("Servers")
+        card, layout = self._panel_card("Servers")
         self.server_status = QLabel("…")
         self.server_status.setStyleSheet(f"color:{INK_60}; font-size:12px;")
         layout.addWidget(self.server_status)
@@ -478,7 +513,7 @@ class MainWindow(QWidget):
         return card
 
     def _build_channel_panel(self) -> QFrame:
-        card, layout, header = self._panel_card("Channels")
+        card, layout = self._panel_card("Channels")
         self.channel_status = QLabel("Pick a server.")
         self.channel_status.setStyleSheet(f"color:{INK_60}; font-size:12px;")
         layout.addWidget(self.channel_status)
@@ -506,7 +541,7 @@ class MainWindow(QWidget):
         return card
 
     def _build_message_panel(self) -> QFrame:
-        card, layout, header = self._panel_card("Messages")
+        card, layout = self._panel_card("Messages")
         self.message_status = QLabel("Pick a channel.")
         self.message_status.setStyleSheet(f"color:{INK_60}; font-size:12px;")
         layout.addWidget(self.message_status)
@@ -548,7 +583,10 @@ class MainWindow(QWidget):
         QMessageBox.critical(self, "Discord", msg)
         self.typing.set_messages(["disconnected.", msg[:40]])
 
-    # -- Server / channel / messages ------------------------------------
+    def _on_log(self, msg: str) -> None:
+        self.typing.set_messages([msg[:40]])
+
+    # -- Server / channel ----------------------------------------------
 
     def _refresh_servers(self) -> None:
         self.server_list.clear()
@@ -572,7 +610,9 @@ class MainWindow(QWidget):
         if not self._current_guild:
             return
         channels = self.service.text_channels(self._current_guild.id)
-        self.channel_status.setText(f"{len(channels)} channels in {self._current_guild.name}")
+        self.channel_status.setText(
+            f"{len(channels)} channels in {self._current_guild.name}"
+        )
         self.download_all_btn.setEnabled(bool(channels))
         for ch in channels:
             item = QListWidgetItem(f"# {ch.name}")
@@ -589,12 +629,24 @@ class MainWindow(QWidget):
         self.download_one_btn.setEnabled(True)
         self._reload_current_channel()
 
+    # -- Messages: load & render ---------------------------------------
+
     def _reload_current_channel(self) -> None:
         if self._current_channel_id is None:
             return
         self._clear_messages()
         self.message_status.setText("Loading…")
-        self.loop.create_task(self._load_messages(self._current_channel_id))
+        cid = self._current_channel_id
+
+        fut = self.service.submit(self.service.fetch_messages_coro(cid, limit=80))
+
+        def done(f: Future) -> None:
+            if f.exception():
+                self._messages_ready.emit(cid, None)
+            else:
+                self._messages_ready.emit(cid, f.result())
+
+        fut.add_done_callback(done)
 
     def _clear_messages(self) -> None:
         while self.message_layout.count() > 1:
@@ -605,21 +657,15 @@ class MainWindow(QWidget):
             if w:
                 w.deleteLater()
 
-    async def _load_messages(self, channel_id: int) -> None:
-        try:
-            msgs = await self.service.fetch_messages(channel_id, limit=80)
-        except discord.Forbidden:
-            self.message_status.setText("No permission to read this channel.")
+    def _render_messages(self, cid: int, msgs: object) -> None:
+        if cid != self._current_channel_id:
             return
-        except Exception as e:  # noqa: BLE001
-            self.message_status.setText(f"Error: {e}")
+        if msgs is None:
+            self.message_status.setText("Failed to load messages.")
             return
-
-        if channel_id != self._current_channel_id:
-            return
-
-        self.message_status.setText(f"{len(msgs)} messages (most recent {len(msgs)})")
-        for m in msgs:
+        msgs_list: List[discord.Message] = list(msgs)  # type: ignore[arg-type]
+        self.message_status.setText(f"{len(msgs_list)} messages")
+        for m in msgs_list:
             card = MessageCard(m)
             if card.save_btn is not None:
                 card.save_btn.clicked.connect(
@@ -627,66 +673,61 @@ class MainWindow(QWidget):
                 )
             self.message_layout.insertWidget(self.message_layout.count() - 1, card)
 
-        # Lazy thumbnails for image attachments
-        await self._load_thumbnails(msgs)
-
-    async def _load_thumbnails(self, msgs: List[discord.Message]) -> None:
-        if not self._http:
-            self._http = aiohttp.ClientSession()
-        # Simple sequential fetch — keeps memory low and respects rate limits.
-        for m in msgs:
+        # Schedule thumbnails
+        for m in msgs_list:
             for att in m.attachments:
-                if not (att.content_type or "").startswith("image/"):
+                ctype = att.content_type or ""
+                if not ctype.startswith("image/"):
                     continue
-                try:
-                    async with self._http.get(att.url) as r:
-                        if r.status != 200:
-                            continue
-                        data = await r.read()
-                except Exception:  # noqa: BLE001
-                    continue
-                pix = QPixmap()
-                if pix.loadFromData(data):
-                    # Find the matching MessageCard and attach.
-                    for i in range(self.message_layout.count()):
-                        w = self.message_layout.itemAt(i).widget()
-                        if isinstance(w, MessageCard) and w._msg.id == m.id:
-                            w.add_thumbnail(pix)
-                            break
+                self._schedule_thumb(m.id, att.url)
+
+    def _schedule_thumb(self, msg_id: int, url: str) -> None:
+        fut = self.service.submit(_fetch_bytes(url))
+
+        def done(f: Future) -> None:
+            if f.exception():
+                return
+            try:
+                data = f.result()
+            except Exception:  # noqa: BLE001
+                return
+            self._thumb_ready.emit(msg_id, data)
+
+        fut.add_done_callback(done)
+
+    def _attach_thumb(self, msg_id: int, data: bytes) -> None:
+        pix = QPixmap()
+        if not pix.loadFromData(data):
+            return
+        for i in range(self.message_layout.count()):
+            w = self.message_layout.itemAt(i).widget()
+            if isinstance(w, MessageCard) and w._msg.id == msg_id:
+                w.add_thumbnail(pix)
+                return
 
     # -- Downloads ------------------------------------------------------
 
     def _save_single_message(self, msg: discord.Message) -> None:
-        self.loop.create_task(self._save_one(msg))
-
-    async def _save_one(self, msg: discord.Message) -> None:
-        guild_name = self._current_guild.name if self._current_guild else "dm"
         ch = self.service.get_channel(msg.channel.id)
         if ch is None:
             return
-        root = downloads_root() / "discord-browser" / safe_name(guild_name) / safe_name(
-            f"{getattr(ch, 'name', 'dm')}-{ch.id}"
-        ) / f"msg-{msg.id}"
-        root.mkdir(parents=True, exist_ok=True)
-        # Write text
-        (root / "message.txt").write_text(
-            f"[{msg.created_at.isoformat(timespec='seconds')}] {msg.author}\n"
-            f"{msg.content or ''}\n",
-            encoding="utf-8",
+        guild_name = self._current_guild.name if self._current_guild else "dm"
+        root = (
+            downloads_root()
+            / "discord-browser"
+            / safe_name(guild_name)
+            / safe_name(f"{getattr(ch, 'name', 'dm')}-{ch.id}")
+            / f"msg-{msg.id}"
         )
-        # Save attachments
-        timeout = aiohttp.ClientTimeout(total=120)
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            for att in msg.attachments:
-                try:
-                    async with s.get(att.url) as r:
-                        r.raise_for_status()
-                        data = await r.read()
-                    (root / safe_name(att.filename)).write_bytes(data)
-                except Exception:  # noqa: BLE001
-                    pass
-        self.typing.set_messages([f"saved msg {msg.id}"])
-        QMessageBox.information(self, "Download", f"Saved to:\n{root}")
+        fut = self.service.submit(_save_message_coro(msg, root))
+
+        def done(f: Future) -> None:
+            if f.exception():
+                self._save_failed.emit(str(f.exception()))
+            else:
+                self._save_done.emit(str(f.result()))
+
+        fut.add_done_callback(done)
 
     def _download_current_channel(self) -> None:
         if self._current_channel_id is None:
@@ -698,7 +739,20 @@ class MainWindow(QWidget):
         dest = downloads_root() / "discord-browser" / safe_name(guild_name)
         limit = self.limit_box.value()
         self.download_one_btn.setEnabled(False)
-        self.loop.create_task(self._run_export([ch], dest, limit, single=True))
+
+        def emit_log(line: str) -> None:
+            self._log.emit(line)
+
+        fut = self.service.submit(export_channel(ch, dest, limit=limit, log=emit_log))
+
+        def done(f: Future) -> None:
+            self.download_one_btn.setEnabled(True)
+            if f.exception():
+                self._save_failed.emit(str(f.exception()))
+            else:
+                self._save_done.emit(str(f.result()))
+
+        fut.add_done_callback(done)
 
     def _download_all_channels(self) -> None:
         if not self._current_guild:
@@ -718,42 +772,32 @@ class MainWindow(QWidget):
         dest = downloads_root() / "discord-browser" / safe_name(self._current_guild.name)
         limit = self.limit_box.value()
         self.download_all_btn.setEnabled(False)
-        self.loop.create_task(self._run_export(channels, dest, limit, single=False))
 
-    async def _run_export(
-        self,
-        channels: List[discord.abc.Messageable],
-        dest: Path,
-        limit: int,
-        *,
-        single: bool,
-    ) -> None:
-        log_lines: List[str] = []
+        def emit_log(line: str) -> None:
+            self._log.emit(line)
 
-        def log(line: str) -> None:
-            log_lines.append(line)
-            self.typing.set_messages([line[:40]])
+        fut = self.service.submit(
+            export_channels(channels, dest, limit=limit, log=emit_log)
+        )
 
-        try:
-            if single:
-                folder = await export_channel(channels[0], dest, limit=limit, log=log)
-            else:
-                folder = await export_channels(channels, dest, limit=limit, log=log)
-        finally:
-            self.download_one_btn.setEnabled(True)
+        def done(f: Future) -> None:
             self.download_all_btn.setEnabled(True)
-        QMessageBox.information(self, "Download finished", f"Saved to:\n{folder}")
+            if f.exception():
+                self._save_failed.emit(str(f.exception()))
+            else:
+                self._save_done.emit(str(f.result()))
 
-    # -- Lifecycle ------------------------------------------------------
+        fut.add_done_callback(done)
 
-    def closeEvent(self, event) -> None:  # noqa: N802 - Qt signature
-        async def _shutdown() -> None:
-            if self._http and not self._http.closed:
-                await self._http.close()
-            await self.service.stop()
+    # -- Save notification handlers -------------------------------------
 
-        self.loop.create_task(_shutdown())
-        event.accept()
+    def _notify_save_done(self, path: str) -> None:
+        self.typing.set_messages(["saved.", path[-40:]])
+        QMessageBox.information(self, "Download finished", f"Saved to:\n{path}")
+
+    def _notify_save_failed(self, err: str) -> None:
+        self.typing.set_messages(["save failed."])
+        QMessageBox.warning(self, "Download failed", err)
 
 
 # ----- Font setup helper --------------------------------------------------
