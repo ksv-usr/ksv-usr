@@ -37,17 +37,24 @@ def _prompt_token() -> str | None:
     return text or None
 
 
-async def _amain() -> None:
-    app = QApplication.instance()
-    assert app is not None  # qasync.run created it for us
+def main() -> int:
+    # Canonical qasync pattern (see qasync README): build the QApplication,
+    # install QEventLoop as the asyncio loop, then drive it with
+    # run_until_complete(close_event.wait()). Using qasync.run() under
+    # Python 3.12 delegates to asyncio.run and skips QApplication setup,
+    # and using loop.run_forever() doesn't pump Qt events well — both
+    # leave discord.py-self stuck at "connecting".
+    app = QApplication.instance() or QApplication(sys.argv)
     install_optional_fonts()
 
     token = _prompt_token()
     if not token:
         QMessageBox.critical(None, "discord.", "A token is required.")
-        return
+        return 1
 
-    loop = asyncio.get_event_loop()
+    loop = qasync.QEventLoop(app)
+    asyncio.set_event_loop(loop)
+
     close_event = asyncio.Event()
     app.aboutToQuit.connect(close_event.set)
 
@@ -56,23 +63,14 @@ async def _amain() -> None:
     window.show()
 
     asyncio.ensure_future(service.start())
-    try:
-        await close_event.wait()
-    finally:
-        await service.stop()
 
-
-def main() -> int:
-    # qasync.run sets up a QApplication, installs the qasync event loop,
-    # and runs the coroutine until completion. This is the documented
-    # pattern — using `with loop: loop.run_forever()` leaves Qt's event
-    # processing un-pumped and hangs discord.py-self at "connecting".
-    if QApplication.instance() is None:
-        QApplication(sys.argv)
-    try:
-        qasync.run(_amain())
-    except asyncio.CancelledError:
-        pass
+    with loop:
+        loop.run_until_complete(close_event.wait())
+        # Best-effort tidy shutdown.
+        try:
+            loop.run_until_complete(service.stop())
+        except Exception:
+            pass
     return 0
 
 
