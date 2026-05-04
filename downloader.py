@@ -187,67 +187,75 @@ async def export_channel(
             _logline("nothing to write")
             return stats
 
+        # `async with` only works with async context managers; file objects
+        # are sync, so the aiohttp session and the files have to live in
+        # separate `with` statements. Putting them on the same line raises
+        # "TextIOWrapper does not support the asynchronous context manager
+        # protocol", and worse, .open("w") truncates messages.txt before the
+        # error is raised — leaving you with 0-byte files.
         timeout = aiohttp.ClientTimeout(total=180)
-        async with aiohttp.ClientSession(timeout=timeout) as session, \
-                (folder / "messages.txt").open("w", encoding="utf-8") as f, \
-                (folder / "links.txt").open("w", encoding="utf-8") as lf:
-            for msg in messages:
-                stats.messages += 1
-                f.write(_format_header(msg) + "\n")
-                if msg.content:
-                    f.write(msg.content + "\n")
+        transcript_path = folder / "messages.txt"
+        links_path = folder / "links.txt"
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            with transcript_path.open("w", encoding="utf-8") as f, \
+                    links_path.open("w", encoding="utf-8") as lf:
+                for msg in messages:
+                    stats.messages += 1
+                    f.write(_format_header(msg) + "\n")
+                    if msg.content:
+                        f.write(msg.content + "\n")
 
-                # Attachments: always download.
-                for att in msg.attachments:
-                    try:
-                        saved = await _save_attachment(session, att, folder)
-                        f.write(f"[attachment] {att.filename} -> {saved.name}\n")
-                        stats.attachments += 1
-                        _logline(f"↓ attachment {saved.name}")
-                    except Exception as e:  # noqa: BLE001
-                        f.write(f"[attachment-failed] {att.filename}: {e}\n")
-                        stats.errors.append(f"attachment {att.filename}: {e}")
-                        _logline(f"! attachment {att.filename}: {e}")
-
-                # URLs in content: Discord CDN -> download, else -> links.txt.
-                for url in _URL_RE.findall(msg.content or ""):
-                    if is_discord_cdn(url):
+                    # Attachments: always download.
+                    for att in msg.attachments:
                         try:
-                            saved = await _save_url(session, url, folder)
-                            f.write(f"[cdn] {url} -> {saved.name}\n")
-                            stats.cdn_files += 1
-                            _logline(f"↓ cdn {saved.name}")
+                            saved = await _save_attachment(session, att, folder)
+                            f.write(f"[attachment] {att.filename} -> {saved.name}\n")
+                            stats.attachments += 1
+                            _logline(f"↓ attachment {saved.name}")
                         except Exception as e:  # noqa: BLE001
-                            f.write(f"[cdn-failed] {url}: {e}\n")
-                            stats.errors.append(f"cdn {url}: {e}")
-                            _logline(f"! cdn {url}: {e}")
-                    else:
-                        lf.write(url + "\n")
-                        stats.other_links += 1
+                            f.write(f"[attachment-failed] {att.filename}: {e}\n")
+                            stats.errors.append(f"attachment {att.filename}: {e}")
+                            _logline(f"! attachment {att.filename}: {e}")
 
-                # Embeds: their .url is generally a preview link, not a file.
-                # Embeds may also expose image/video proxies on the CDN —
-                # download those, log the rest.
-                for emb in msg.embeds:
-                    candidate = None
-                    for src in (emb.image, emb.thumbnail, emb.video):
-                        u = getattr(src, "url", None)
-                        if u and is_discord_cdn(u):
-                            candidate = u
-                            break
-                    if candidate:
-                        try:
-                            saved = await _save_url(session, candidate, folder)
-                            f.write(f"[embed-cdn] {candidate} -> {saved.name}\n")
-                            stats.cdn_files += 1
-                        except Exception as e:  # noqa: BLE001
-                            f.write(f"[embed-cdn-failed] {candidate}: {e}\n")
-                            stats.errors.append(f"embed-cdn {candidate}: {e}")
-                    elif emb.url:
-                        lf.write(emb.url + "\n")
-                        stats.other_links += 1
+                    # URLs in content: Discord CDN -> download, else -> links.txt.
+                    for url in _URL_RE.findall(msg.content or ""):
+                        if is_discord_cdn(url):
+                            try:
+                                saved = await _save_url(session, url, folder)
+                                f.write(f"[cdn] {url} -> {saved.name}\n")
+                                stats.cdn_files += 1
+                                _logline(f"↓ cdn {saved.name}")
+                            except Exception as e:  # noqa: BLE001
+                                f.write(f"[cdn-failed] {url}: {e}\n")
+                                stats.errors.append(f"cdn {url}: {e}")
+                                _logline(f"! cdn {url}: {e}")
+                        else:
+                            lf.write(url + "\n")
+                            stats.other_links += 1
 
-                f.write("\n")
+                    # Embeds: their .url is generally a preview link, not a file.
+                    # Embeds may also expose image/video proxies on the CDN —
+                    # download those, log the rest.
+                    for emb in msg.embeds:
+                        candidate = None
+                        for src in (emb.image, emb.thumbnail, emb.video):
+                            u = getattr(src, "url", None)
+                            if u and is_discord_cdn(u):
+                                candidate = u
+                                break
+                        if candidate:
+                            try:
+                                saved = await _save_url(session, candidate, folder)
+                                f.write(f"[embed-cdn] {candidate} -> {saved.name}\n")
+                                stats.cdn_files += 1
+                            except Exception as e:  # noqa: BLE001
+                                f.write(f"[embed-cdn-failed] {candidate}: {e}\n")
+                                stats.errors.append(f"embed-cdn {candidate}: {e}")
+                        elif emb.url:
+                            lf.write(emb.url + "\n")
+                            stats.other_links += 1
+
+                    f.write("\n")
 
         _logline(
             f"done: {stats.messages} messages, {stats.attachments} attachments, "
